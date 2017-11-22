@@ -1,0 +1,188 @@
+---
+- name: Connect to AWS
+  hosts: localhost
+  connection: local
+  gather_facts: True
+  vars_prompt:
+    - name: "vpc_id"
+      prompt: "Please enter your VPC ID (vpc-xzy12345)"
+      private: no
+    - name: "region"
+      prompt: "Please enter your AWS region (for example us-east-1|eu-west-1|ca-central-1)"
+      private: no
+    - name: "subnet_name"
+      prompt: "Please enter name of a public subnet in your VPC
+      private: no
+    - name: "keypair"
+      prompt: "Please enter name of your SSH keypair
+      private: no
+
+  vars:
+    instance_type: t2.small
+    component_name: centos_image
+    use_public_ip: "yes"
+    instance_count: 1
+    volume_type: gp2
+    root_disk_size: 2
+    component_rules:
+      - proto: tcp
+        from_port: 22
+        to_port: 22
+        cidr_ip: "0.0.0.0/0"
+
+  tasks:
+    - name: Find CentOS 7 AMI
+      ec2_ami_find:
+        name: "CentOS Linux 7 x86_64 HVM EBS*"
+        region: "{{ region }}"
+        sort: name
+        sort_order: descending
+        sort_end: 1
+      register: centos_image_7
+
+    - name: Create Component Specfic SG.
+      ec2_group:
+        name: "{{component_name}}_SG"
+        description: "Security group for {{component_name}} purposes"
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ region }}"
+        rules: "{{component_rules}}"
+        rules_egress:
+          - proto: all
+            cidr_ip: 0.0.0.0/0
+        state: present
+      register: component_sg
+
+    - name: Tag the security group with a name
+      local_action:
+        module: ec2_tag
+        resource: "{{component_sg.group_id}}"
+        region: "{{ region }}"
+        state: present
+        tags:
+          Name: "{{component_name}}_SG"
+
+    - name: Deploy CentOS 7 instance
+      ec2:
+        region: "{{ region }}"
+        key_name: "{{ keypair }}"
+        image: "{{ centos_image_7.results[0].ami_id }}"
+        wait: yes
+        wait_timeout: 300
+        group_id: "{{component_sg.group_id}}"
+        count: 1
+        monitoring: no
+        instance_tags:
+          Name: centos7_instance_temp
+        vpc_subnet_id: "{{ subnet_name }}"
+        assign_public_ip: "{{ use_public_ip }}"
+        instance_type: "{{ instance_type }}"
+        volumes:
+          - device_name: /dev/sda1
+            volume_type: "{{volume_type}}"
+            volume_size: "{{ root_disk_size }}"
+            delete_on_termination: True
+      register: ec2
+
+    - name: Add new instance to host group
+      add_host:
+        groupname: serversToInstall
+        hostname: '{{ item }}'
+        ansible_ssh_user: centos
+        ansible_ssh_private_key_file: "/Users/msaidelk/.ssh/id_rsa"
+      with_items:
+        - "{{ ec2.instances[0].public_ip }}"
+      register: ec2_ip
+
+    - name: Wait for the instances to boot by checking the ssh port
+      wait_for:
+        port=22
+        delay=60
+        timeout=300
+        state=started
+        host = "{{ item.add_host.host_name }}"
+      with_items: "{{ ec2_ip.results }}"
+
+## Instance Configuration
+- name: Configure nodes
+  hosts: serversToInstall
+  user: centos
+  become: yes
+  become_method: sudo
+  gather_facts: True
+
+  pre_tasks:
+    - name: Generalize image
+      shell: |
+          yum update -y
+          yum install -y cloud-init cloud-utils cloud-utils-growpart dos2unix vim iotop wget
+          service rsyslog stop
+          service auditd stop
+          logrotate -f /etc/logrotate.conf
+          rm -f /var/log/*-???????? /var/log/*.gz
+          rm -f /var/log/dmesg.old
+          rm -rf /var/log/anaconda
+          cat /dev/null > /var/log/audit/audit.log
+          cat /dev/null > /var/log/tuned/tuned.log
+          cat /dev/null > /var/log/boot.log
+          cat /dev/null > /var/log/cloud-init-output.log
+          cat /dev/null > /var/log/wtmp
+          cat /dev/null > /var/log/lastlog
+          cat /dev/null > /var/log/grubby
+          rm -rf /var/log/dmesg
+          rm -rf /tmp/*
+          rm -rf /var/tmp/*
+          rm -f ~root/.bash_history
+          unset HISTFILE
+          rm -rf ~root/.ssh/
+          rm -f ~root/anaconda-ks.cfg
+          poweroff
+
+### AMI Creation
+- name: Image creation
+  hosts: localhost
+  connection: local
+  gather_facts: True
+  vars:
+    component_name: centos_image
+
+  tasks:
+    - name: Wait for the instance to shutdown by checking the ssh port
+      wait_for:
+        port=22
+        delay=120
+        timeout=120
+        state=stopped
+        host="{{ hostvars['localhost']['ec2']['instances'][0]['public_ip'] }}"
+
+    - name: Pause (wait for the instance to stop)
+      pause:
+        seconds: 45
+
+    - name: Create image from CentOS7 instance
+      ec2_ami:
+        region: "{{ region }}"
+        instance_id: "{{ hostvars['localhost']['ec2']['instances'][0]['id'] }}"
+        name: "Cloud_Walkabout_CentOS_7.0"
+        description: "The Cloud Walkbout Centos 7.0 image"
+        tags:
+          Name: "Cloud_Walkabout_CentOS_7.0"
+        wait: yes
+      register: centos7_image_name
+
+### Clean Up
+    - name: Terminate Temporary Instances
+      ec2:
+        state: absent
+        region: "{{ region }}"
+        instance_ids: "{{ item }}"
+      with_items:
+      - "{{ hostvars['localhost']['ec2']['instances'][0]['id'] }}"
+
+    - name: Remove Component Specfic SG.
+      ec2_group:
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ region }}"
+        name: "{{component_name}}_SG"
+        description: "Security group for {{component_name}} purposes"
+        state: absent
